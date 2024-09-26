@@ -12,12 +12,33 @@ from sklearn.preprocessing import StandardScaler
 import torch.nn.functional as F
 import warnings
 
+seq_length = 30
+rsi_length = seq_length -1 
+feature_count = 6
+cols = ['Close', 'MA10', 'MA20', 'RSI','sell_vol', 'buy_vol' ]
+
 # UserWarning 무시 (필요 시 제거 가능)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # 디바이스 설정 (GPU 사용 여부 확인)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Using device: {device}')
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, embed_dim, max_length):
+        super(PositionalEncoding, self).__init__()
+        self.encoding = torch.zeros(max_length, embed_dim)
+        position = torch.arange(0, max_length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * -(np.log(10000) / embed_dim))
+        
+        self.encoding[:, 0::2] = torch.sin(position * div_term) # 짝수
+        self.encoding[:, 1::2] = torch.cos(position * div_term) # 홀수
+        self.encoding = self.encoding.unsqueeze(0)
+    
+    def forward(self, x):
+        # 입력 텐서 길이에 따라 포지셔널 인코딩 추가
+        # seq_len = x.size(1)
+        return x + self.encoding
 
 # transformer 모듈 정의 (트랜스포머 기반 시계열 처리 모델)
 class Transformer(nn.Module):
@@ -37,7 +58,7 @@ class Transformer(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
         self.output_linear = nn.Linear(embed_dim, embed_dim)
-        self.activation = nn.ReLU()
+        self.activation = nn.GELU()
 
     def forward(self, x):
         """
@@ -51,16 +72,19 @@ class Transformer(nn.Module):
         x = x[:, -1, :]           # [batch_size, embed_dim]
         return x
 
+
+
 # 다중 종목 주식 트레이딩 환경 정의
 class MultiStockTradingEnv(gym.Env):
-    def __init__(self, dfs, stock_dim=3, initial_balance=1000000, max_stock=100, seq_length=20):
+    def __init__(self, dfs, stock_dim=1, initial_balance=1000000000, max_stock=100, seq_length=20):
         super(MultiStockTradingEnv, self).__init__()
         self.dfs = dfs  # 종목별 데이터프레임 딕셔너리
         self.stock_dim = stock_dim  # 종목 수
         self.initial_balance = initial_balance  # 초기 자본금
         self.max_stock = max_stock  # 각 종목당 최대 보유 주식 수
-        self.transaction_fee = 0.0025  # 거래 수수료 0.25%
-        self.slippage = 0.003  # 슬리피지 0.3%
+        self.transaction_fee = 0.00015  # 거래 수수료 0.25%
+        self.national_tax = 0.0018
+        self.slippage = 0.0  # 슬리피지 0.3%
         self.max_loss = 0.2  # 최대 허용 손실 (20%)
         self.seq_length = seq_length  # 시퀀스 길이
 
@@ -69,7 +93,7 @@ class MultiStockTradingEnv(gym.Env):
         # 각 종목: (4 * seq_length) + 1 (보유 주식 수)
         # 총: stock_dim * (4 * seq_length +1) + 1 (balance)
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.stock_dim * (4 * self.seq_length + 1) + 1,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.stock_dim * (feature_count * self.seq_length + 1) + 1,), dtype=np.float32
         )
         self.action_space = spaces.MultiDiscrete([9] * self.stock_dim)  # 각 종목별로 9개의 액션
 
@@ -107,14 +131,14 @@ class MultiStockTradingEnv(gym.Env):
             idx = self.data_indices[ticker]
             if idx < self.seq_length:
                 # 충분한 시퀀스가 없으면 제로 패딩
-                seq = df.loc[:idx, ['Close', 'MA10', 'MA20', 'RSI']].values
+                seq = df.loc[:idx, cols].values
                 pad_length = self.seq_length - seq.shape[0]
                 if pad_length > 0:
-                    pad = np.zeros((pad_length, 4))
+                    pad = np.zeros((pad_length, feature_count))
                     seq = np.vstack((pad, seq))
             else:
                 # 시퀀스 슬라이싱
-                seq = df.loc[idx - self.seq_length:idx - 1, ['Close', 'MA10', 'MA20', 'RSI']].values
+                seq = df.loc[idx - self.seq_length:idx - 1, cols].values
             obs.extend(seq.flatten())  # [seq_length * 4]
             obs.append(self.stock_owned[ticker]['quantity'])  # [1]
 
@@ -173,7 +197,8 @@ class MultiStockTradingEnv(gym.Env):
                 adjusted_price = actual_price
 
             # 거래 수수료 계산
-            fee = adjusted_price * self.transaction_fee
+            buy_fee = adjusted_price * self.transaction_fee
+            sell_fee = adjusted_price * (self.transaction_fee + self.national_tax)
 
             # buy_amount과 sell_amount 초기화
             buy_amount = 0
@@ -186,10 +211,10 @@ class MultiStockTradingEnv(gym.Env):
                     sell_amount = int(self.stock_owned[ticker]['quantity'] * proportion)
                     sell_amount = max(1, sell_amount)  # 최소 1주 매도
                     sell_amount = min(sell_amount, self.stock_owned[ticker]['quantity'])  # 보유 주식 수 초과 방지
-                    proceeds = adjusted_price * sell_amount - fee * sell_amount
+                    proceeds = adjusted_price * sell_amount - sell_fee * sell_amount
                     self.balance += proceeds
                     # 이익 또는 손실 계산
-                    profit = (adjusted_price - self.stock_owned[ticker]['avg_price']) * sell_amount - fee * sell_amount
+                    profit = (adjusted_price - self.stock_owned[ticker]['avg_price']) * sell_amount - sell_fee * sell_amount
                     reward = profit  # 매도 시 보상은 이익 또는 손실
                     self.stock_owned[ticker]['quantity'] -= sell_amount
                     if self.stock_owned[ticker]['quantity'] == 0:
@@ -202,14 +227,14 @@ class MultiStockTradingEnv(gym.Env):
             elif action_type == 'buy':
                 max_can_buy = min(
                     self.max_stock - self.stock_owned[ticker]['quantity'],
-                    int(self.balance // (adjusted_price + fee))
+                    int(self.balance // (adjusted_price + buy_fee))
                 )
                 buy_amount = int(max_can_buy * proportion)
                 buy_amount = max(1, buy_amount)  # 최소 1주 매수
                 buy_amount = min(buy_amount, self.max_stock - self.stock_owned[ticker]['quantity'], 
-                                 int(self.balance // (adjusted_price + fee)))
+                                 int(self.balance // (adjusted_price + buy_fee)))
                 if buy_amount > 0:
-                    cost = adjusted_price * buy_amount + fee * buy_amount
+                    cost = adjusted_price * buy_amount + buy_fee * buy_amount
                     self.balance -= cost
                     # 평균 매수가격 업데이트
                     total_quantity = self.stock_owned[ticker]['quantity'] + buy_amount
@@ -240,7 +265,14 @@ class MultiStockTradingEnv(gym.Env):
             print(f"Ticker: {ticker}, Action: {action_type}, Proportion: {proportion}, "
                   f"Buy/Sell Amount: {buy_amount if action_type == 'buy' else sell_amount if action_type == 'sell' else 0}, "
                   f"Balance: {self.balance:.2f}, Holdings: {self.stock_owned[ticker]['quantity']}")
-
+            
+            
+            # if i % 10 == 0:
+            #     print(f"Ticker: {ticker}, Action: {action_type}, Proportion: {proportion}, "
+            #           f"Buy/Sell Amount: {buy_amount if action_type == 'buy' else sell_amount if action_type == 'sell' else 0}, "
+            #           f"Balance: {self.balance:.2f}, Holdings: {self.stock_owned[ticker]['quantity']}"
+            #           f"Total reward: {total_reward:.4f}")
+            
             # 잔고와 보유 주식 수량이 음수가 되지 않도록 방지
             if self.balance < 0:
                 print(f"Warning: Balance for {ticker} is negative! Setting to 0.")
@@ -296,12 +328,18 @@ class MultiStockTradingEnv(gym.Env):
         obs = self._next_observation()
         return obs, total_reward, done, {}
 
+
+# ================================================================================================================================================
+
+
+
 # 데이터 로드 및 기술적 지표 계산
-tickers = ['AAPL', 'MSFT', 'GOOGL']
+tickers = ['000660']
 dfs = {}
 for ticker in tickers:
-    df = yf.download(ticker, start='2020-01-01', end='2020-12-31', progress=False)
-
+    # df = yf.download(ticker, start='2020-01-01', end='2020-12-31', progress=False)
+    df = pd.read_csv(f'{ticker}.csv',encoding='cp949')
+    df = df.rename(columns={'종가':'Close', '매도량':'sell_vol' , '매수량':'buy_vol'})
     # 원래의 Close 가격 보존
     df.loc[:, 'Close_unscaled'] = df['Close']  # 실제 가격 저장
 
@@ -313,8 +351,8 @@ for ticker in tickers:
     delta = df['Close'].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
-    ema_up = up.ewm(com=13, adjust=False).mean()
-    ema_down = down.ewm(com=13, adjust=False).mean()
+    ema_up = up.ewm(com=rsi_length, adjust=False).mean()
+    ema_down = down.ewm(com=rsi_length, adjust=False).mean()
     rs = ema_up / ema_down
     df.loc[:, 'RSI'] = 100 - (100 / (1 + rs))
 
@@ -322,20 +360,21 @@ for ticker in tickers:
 
     # 입력 데이터 정규화
     scaler = StandardScaler()
-    feature_cols = ['Close', 'MA10', 'MA20', 'RSI']
+    feature_cols = cols
     df.loc[:, feature_cols] = scaler.fit_transform(df[feature_cols])
 
     dfs[ticker] = df.reset_index(drop=True)
 
 # 환경 생성 (초기 자본금 증가 및 시퀀스 길이 설정)
-env = MultiStockTradingEnv(dfs, initial_balance=1000000, seq_length=20)
+env = MultiStockTradingEnv(dfs, initial_balance=10000000, seq_length=seq_length)
 
 # PPO를 위한 액터-크리틱 신경망 정의
 class ActorCritic(nn.Module):
     def __init__(self, input_dim, action_dim_list, seq_length=20):
         super(ActorCritic, self).__init__()
         self.seq_length = seq_length
-        self.transformer = Transformer(input_dim=4, seq_length=seq_length).to(device)  # input_dim=4 (Close, MA10, MA20, RSI)
+        # self.input_dim = input_dim
+        self.transformer = Transformer(input_dim=feature_count, seq_length=seq_length).to(device)  # input_dim=4 (Close, MA10, MA20, RSI)
         self.policy_head = nn.ModuleList([nn.Linear(self.transformer.embed_dim, action_dim) for action_dim in action_dim_list])
         self.value_head = nn.Linear(self.transformer.embed_dim * len(action_dim_list), 1)  # embed_dim * stock_dim
         self.apply(self._weights_init)  # 가중치 초기화
@@ -348,16 +387,16 @@ class ActorCritic(nn.Module):
 
     def forward(self, x):
         """
-        x: [batch_size, stock_dim * (4 * seq_length +1) +1]
+        x: [batch_size, stock_dim * (4 * seq_length + 1) + 1]
         """
         stock_embeds = []
         for i, ticker in enumerate(tickers):
             # 각 종목의 시퀀스 데이터: [batch_size, 4 * seq_length]
-            start = i * (4 * self.seq_length + 1)
-            end = start + 4 * self.seq_length
+            start = i * (feature_count * self.seq_length + 1)
+            end = start + feature_count * self.seq_length
             seq = x[:, start:end]
             # Reshape to [batch_size, seq_length, 4]
-            seq = seq.view(-1, self.seq_length, 4)
+            seq = seq.view(-1, self.seq_length, feature_count)
             embed = self.transformer(seq)  # [batch_size, embed_dim]
             stock_embeds.append(embed)
         # 정책 헤드는 각 embed를 처리하여 policy logits을 생성
@@ -373,6 +412,7 @@ class ActorCritic(nn.Module):
         actions = []
         action_logprobs = []
         for logits in policy_logits:
+            
             dist = Categorical(logits=logits)
             action = dist.sample()
             actions.append(action.item())
@@ -394,15 +434,15 @@ class ActorCritic(nn.Module):
 
 # 하이퍼파라미터 설정
 learning_rate = 1e-4  # 학습률
-gamma = 0.99
+gamma = 0.8
 epsilon = 0.2
-epochs = 10  # 에폭 수
+epochs = 100  # 에폭 수
 
 # 정책 및 옵티마이저 초기화
 input_dim = env.observation_space.shape[0]
 action_dim_list = [9] * env.stock_dim  # 각 종목별 9개의 액션
 policy = ActorCritic(input_dim, action_dim_list, seq_length=env.seq_length).to(device)  # 모델을 GPU로 이동
-optimizer = optim.Adam(policy.parameters(), lr=learning_rate)
+optimizer = optim.AdamW(policy.parameters(), lr=learning_rate)
 
 # 메모리 클래스 정의
 class Memory:
@@ -475,7 +515,8 @@ def ppo_update():
         optimizer.step()
 
         # 손실 값 출력
-        print(f"Epoch {epoch+1}, Loss: {loss_mean.item():.4f}")
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch+1}, Loss: {loss_mean.item():.4f}")
 
 # 학습 루프
 max_episodes = 100  # 에피소드 수
